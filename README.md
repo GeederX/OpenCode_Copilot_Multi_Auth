@@ -253,7 +253,7 @@ These metrics are intentionally in-memory and ephemeral; they are intended for d
 
 ## Notes
 
-- **Provider ID**: `github-copilot-multi` (overrides the built-in `github-copilot`)
+- **Provider override**: the plugin hooks into the built-in `github-copilot` provider instead of introducing a separate model provider ID
 - Cooldown after quota hit uses `Retry-After` when present, otherwise defaults to 90 seconds.
 - Maximum retry attempts are bounded by account count and internal cap.
 - Maximum retry attempts are bounded by account count and internal cap.

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { __testExports } from "./index.js";
 import { invalidateStorageCache } from "./index.js";
+import CopilotMultiAuthPlugin from "./index.js";
 
 describe("multi-auth oauth helpers", () => {
   it("uses stable account id from token hash", () => {
@@ -10,6 +11,11 @@ describe("multi-auth oauth helpers", () => {
 
     expect(id1).toBe(id2);
     expect(id1).not.toBe(id3);
+  });
+
+  it("overrides the built-in github-copilot provider id", async () => {
+    const hooks = await CopilotMultiAuthPlugin({} as any);
+    expect(hooks.auth?.provider).toBe("github-copilot");
   });
 
   it("merges account by token identity", () => {

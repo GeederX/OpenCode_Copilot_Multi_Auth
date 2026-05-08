@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { __testExports } from "./index.js";
 import { invalidateStorageCache } from "./index.js";
+import CopilotMultiAuthPlugin from "./index.js";
 
 describe("multi-auth oauth helpers", () => {
   it("uses stable account id from token hash", () => {
@@ -110,6 +111,93 @@ describe("multi-auth oauth helpers", () => {
     delete process.env.COPILOT_FAKE_KEYCHAIN;
   });
 
+  it("stores keychain-backed OAuth tokens under the custom account id", async () => {
+    __testExports.resetRuntimeState();
+    process.env.COPILOT_FAKE_KEYCHAIN = "1";
+
+    const originalFs = __testExports.__fs;
+    const originalMkdir = originalFs.mkdir;
+    const originalRead = originalFs.readFile;
+    const originalWrite = originalFs.writeFile;
+    const originalRename = originalFs.rename;
+    const originalUnlink = originalFs.unlink;
+    const originalChmod = originalFs.chmod;
+    const originalFetch = globalThis.fetch;
+    let persisted = JSON.stringify({ version: 1, accounts: [] });
+    const tempWrites = new Map<string, string>();
+
+    (originalFs as any).mkdir = async () => undefined as any;
+    (originalFs as any).readFile = async () => persisted;
+    (originalFs as any).writeFile = async (path: string, contents: string) => {
+      tempWrites.set(path, contents);
+      return undefined as any;
+    };
+    (originalFs as any).rename = async (from: string) => {
+      persisted = tempWrites.get(from) ?? persisted;
+      tempWrites.delete(from);
+      return undefined as any;
+    };
+    (originalFs as any).unlink = async (path: string) => {
+      tempWrites.delete(path);
+      return true as any;
+    };
+    (originalFs as any).chmod = async () => undefined as any;
+
+    // @ts-ignore
+    globalThis.fetch = (url: RequestInfo | URL) => {
+      const href = url.toString();
+      if (href.includes("/login/device/code")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              verification_uri: "https://github.com/login/device",
+              user_code: "ABCD-EFGH",
+              device_code: "device-code-1",
+              interval: 0,
+            }),
+            { status: 200 },
+          ),
+        );
+      }
+      if (href.includes("/login/oauth/access_token")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({ access_token: "refresh-token-1" }),
+            { status: 200 },
+          ),
+        );
+      }
+      throw new Error(`Unexpected fetch: ${href}`);
+    };
+
+    try {
+      const hooks = await CopilotMultiAuthPlugin({} as any);
+      const flow = await (hooks.auth!.methods[0] as any).authorize({
+        accountId: "work-main",
+      });
+      const result = await flow.callback();
+
+      expect(result.type).toBe("success");
+      expect(await __testExports.keychainGet("work-main")).toBe("refresh-token-1");
+
+      const saved = JSON.parse(persisted);
+      expect(saved.accounts).toHaveLength(1);
+      expect(saved.accounts[0].id).toBe("work-main");
+      expect(saved.accounts[0].refreshToken).toBe("[KEYCHAIN]");
+    } finally {
+      (originalFs as any).mkdir = originalMkdir;
+      (originalFs as any).readFile = originalRead;
+      (originalFs as any).writeFile = originalWrite;
+      (originalFs as any).rename = originalRename;
+      (originalFs as any).unlink = originalUnlink;
+      (originalFs as any).chmod = originalChmod;
+      // @ts-ignore
+      globalThis.fetch = originalFetch;
+      delete process.env.COPILOT_FAKE_KEYCHAIN;
+      __testExports.resetRuntimeState();
+    }
+  });
+
   it("throws explicit error when refresh fails with invalid_grant", async () => {
     const account = __testExports.mergeAccount([], "refresh-token")[0]!;
     account.accessToken = undefined;
@@ -129,6 +217,124 @@ describe("multi-auth oauth helpers", () => {
     } finally {
       // @ts-ignore
       globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("fails over to the next account when token refresh fails", async () => {
+    __testExports.resetRuntimeState();
+
+    const first = {
+      ...__testExports.mergeAccount([], "bad-token")[0]!,
+      name: "first",
+    };
+    const second = {
+      ...__testExports.mergeAccount([], "good-token")[0]!,
+      name: "second",
+    };
+
+    const originalFs = __testExports.__fs;
+    const originalRead = originalFs.readFile;
+    const originalWrite = originalFs.writeFile;
+    const originalRename = originalFs.rename;
+    const originalUnlink = originalFs.unlink;
+    const originalChmod = originalFs.chmod;
+    const originalMkdir = originalFs.mkdir;
+    const originalFetch = globalThis.fetch;
+
+    let persisted = JSON.stringify({
+      version: 1,
+      accounts: [first, second],
+    });
+    const tempWrites = new Map<string, string>();
+
+    (originalFs as any).mkdir = async () => undefined as any;
+    (originalFs as any).readFile = async () => persisted;
+    (originalFs as any).writeFile = async (path: string, contents: string) => {
+      tempWrites.set(path, contents);
+      return undefined as any;
+    };
+    (originalFs as any).rename = async (from: string) => {
+      persisted = tempWrites.get(from) ?? persisted;
+      tempWrites.delete(from);
+      return undefined as any;
+    };
+    (originalFs as any).unlink = async (path: string) => {
+      tempWrites.delete(path);
+      return true as any;
+    };
+    (originalFs as any).chmod = async () => undefined as any;
+
+    // @ts-ignore
+    globalThis.fetch = (url: RequestInfo | URL, init?: RequestInit) => {
+      const href = url.toString();
+      if (href.includes("/login/oauth/access_token")) {
+        const body = JSON.parse(String(init?.body || "{}"));
+        if (body.refresh_token === "bad-token") {
+          return Promise.resolve(
+            new Response(JSON.stringify({ error: "invalid_grant" }), {
+              status: 400,
+            }),
+          );
+        }
+        if (body.refresh_token === "good-token") {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({ access_token: "good-access", expires_in: 3600 }),
+              { status: 200 },
+            ),
+          );
+        }
+      }
+
+      if (href.includes("/chat/completions")) {
+        const auth = new Headers(init?.headers).get("authorization");
+        return Promise.resolve(
+          new Response("ok", { status: auth === "Bearer good-access" ? 200 : 401 }),
+        );
+      }
+
+      throw new Error(`Unexpected fetch: ${href}`);
+    };
+
+    try {
+      const hooks = await CopilotMultiAuthPlugin({} as any);
+      const loaded = await hooks.auth!.loader!(
+        async () => ({ type: "oauth" } as any),
+        {} as any,
+      );
+
+      const response = await (loaded.fetch as any)(
+        "https://copilot-proxy.test/chat/completions",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "gpt-4.1",
+            messages: [{ role: "user", content: "hello" }],
+          }),
+        },
+      );
+
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe("ok");
+
+      const metrics = __testExports.__metrics_get();
+      expect(metrics.refresh.fail).toBe(1);
+      expect(metrics.refresh.success).toBe(1);
+      expect(metrics.attemptsByAccount[first.id]).toBe(1);
+      expect(metrics.attemptsByAccount[second.id]).toBe(1);
+      expect(metrics.successesByAccount[second.id]).toBe(1);
+    } finally {
+      (originalFs as any).readFile = originalRead;
+      (originalFs as any).writeFile = originalWrite;
+      (originalFs as any).rename = originalRename;
+      (originalFs as any).unlink = originalUnlink;
+      (originalFs as any).chmod = originalChmod;
+      (originalFs as any).mkdir = originalMkdir;
+      // @ts-ignore
+      globalThis.fetch = originalFetch;
+      __testExports.resetRuntimeState();
+      invalidateStorageCache();
     }
   });
 

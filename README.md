@@ -25,21 +25,21 @@ This is not only manual priority ordering. It is automatic account-pool rotation
 ## Install
 
 ```bash
-npm install -g @ojpalenzuela/opencode-copilot-multi-auth@0.1.1
+npm install -g @geederx/opencode-copilot-multi-auth@0.1.1
 ```
 
 Add to `opencode.json`:
 
 ```json
 {
-  "plugin": ["@ojpalenzuela/opencode-copilot-multi-auth@0.1.1"]
+  "plugin": ["@geederx/opencode-copilot-multi-auth@0.1.1"]
 }
 ```
 
 ### Option C: via opencode plugin install (recommended)
 
 ```bash
-opencode plugin install @ojpalenzuela/opencode-copilot-multi-auth@0.1.1
+opencode plugin install @geederx/opencode-copilot-multi-auth@0.1.1
 ```
 
 ```json

@@ -415,6 +415,23 @@ export function invalidateStorageCache() {
   storageCache = null;
 }
 
+function resetRuntimeState() {
+  invalidateStorageCache();
+  cooldownUntilByAccount.clear();
+  usageCountByAccount.clear();
+  unsupportedModelsByAccount.clear();
+  metrics.attemptsByAccount.clear();
+  metrics.successesByAccount.clear();
+  metrics.failuresByType = { "429": 0, "403": 0, other: 0 };
+  metrics.refresh = { success: 0, fail: 0 };
+  keychainInitialized = false;
+  keychainAvailableFlag = false;
+  keytarModule = null;
+  if ((globalThis as any).__fake_keychain_map instanceof Map) {
+    (globalThis as any).__fake_keychain_map.clear();
+  }
+}
+
 // Wrap fs/promises functions so tests can replace them when needed without complex module mocking.
 export const __fs = {
   mkdir,
@@ -944,8 +961,9 @@ export const CopilotMultiAuthPlugin: Plugin = async (
             try {
               // On new authorization, attempt to store secret in keychain first.
               const derivedId = shaTokenId(data.access_token);
+              const storageAccountID = accountID || derivedId;
               const kcOk = await keychainSet(
-                derivedId,
+                storageAccountID,
                 data.access_token,
               ).catch(() => false);
               const storage = await loadStorage();
@@ -958,7 +976,7 @@ export const CopilotMultiAuthPlugin: Plugin = async (
               if (kcOk) {
                 // Replace raw token with placeholder for security
                 storage.accounts = storage.accounts.map((acc) =>
-                  acc.id === derivedId
+                  acc.id === storageAccountID
                     ? { ...acc, refreshToken: "[KEYCHAIN]" }
                     : acc,
                 );
@@ -1082,7 +1100,17 @@ export const CopilotMultiAuthPlugin: Plugin = async (
               }
 
               // Get valid access token (may refresh from refresh token)
-              const accessToken = await getValidAccessToken(selected);
+              let accessToken: string;
+              try {
+                accessToken = await getValidAccessToken(selected);
+              } catch (err) {
+                log(
+                  `Auth refresh failed for account ${selected.name}: ${err instanceof Error ? err.message : String(err)}`,
+                  "warn",
+                );
+                excluded.add(selected.id);
+                continue;
+              }
 
               const headers = new Headers(replayable.init.headers);
               headers.set("x-initiator", isAgent ? "agent" : "user");
@@ -1254,6 +1282,7 @@ export const __testExports = {
   __fs,
   loadStorage,
   saveStorage,
+  resetRuntimeState,
   // Observability exports for tests/debug (no secrets)
   __metrics_get: getMetricsSnapshot,
   __metrics_reset: () => {

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import lockfile from "proper-lockfile";
 import {
   mkdir,
   readFile,
@@ -20,7 +21,9 @@ type ModelRule = {
 type StoredAccount = {
   id: string;
   name: string;
-  refreshToken: string; // GitHub OAuth refresh token (long-term, ~6 months)
+  refreshToken: string; // Legacy field name: the GitHub OAuth access token, not a refresh grant.
+  enterpriseUrl?: string;
+  tokenHash?: string;
   accessToken?: string; // Cached OAuth access token
   accessTokenExpiresAt?: number; // Timestamp when access token expires
   priority: number;
@@ -38,10 +41,9 @@ type RuntimeAccount = StoredAccount;
 
 const CLIENT_ID = "Ov23li8tweQw6odWQebz";
 const OAUTH_POLLING_SAFETY_MARGIN_MS = 3000;
-const USER_AGENT = "opencode-copilot-multi-auth/0.4.0";
+const USER_AGENT = "opencode-copilot-multi-auth/0.5.0";
 const DEFAULT_COOLDOWN_SECONDS = 90;
 const DEFAULT_MAX_ATTEMPTS = 10;
-const TOKEN_REFRESH_MARGIN_SECONDS = 60; // Refresh token 1 minute before expiry
 
 const LOG_LEVEL_PRIORITY = {
   info: 10,
@@ -66,7 +68,6 @@ const metrics = {
   attemptsByAccount: new Map<string, number>(),
   successesByAccount: new Map<string, number>(),
   failuresByType: { "429": 0, "403": 0, other: 0 } as Record<string, number>,
-  refresh: { success: 0, fail: 0 },
 };
 
 const STRUCTURED_LOGS =
@@ -122,14 +123,6 @@ function recordFailure(status: number) {
   else metrics.failuresByType.other += 1;
 }
 
-function recordRefreshSuccess() {
-  metrics.refresh.success += 1;
-}
-
-function recordRefreshFail() {
-  metrics.refresh.fail += 1;
-}
-
 function getMetricsSnapshot() {
   return {
     attemptsByAccount: Object.fromEntries(metrics.attemptsByAccount.entries()),
@@ -137,12 +130,32 @@ function getMetricsSnapshot() {
       metrics.successesByAccount.entries(),
     ),
     failuresByType: { ...metrics.failuresByType },
-    refresh: { ...metrics.refresh },
   };
 }
 
-function normalizeDomain(url: string) {
-  return url.replace(/^https?:\/\//, "").replace(/\/$/, "");
+function normalizeDomain(value: string): string {
+  const url = new URL(value.includes("://") ? value.trim() : `https://${value.trim()}`);
+  if (url.protocol !== "https:" || url.username || url.password || url.port ||
+      url.pathname !== "/" || url.search || url.hash || !url.hostname) {
+    throw new Error("Enter an HTTPS domain without credentials, port, path, query, or fragment");
+  }
+  return url.hostname.toLowerCase();
+}
+
+function accountBaseURL(account: Pick<StoredAccount, "enterpriseUrl">): string {
+  return account.enterpriseUrl
+    ? `https://copilot-api.${normalizeDomain(account.enterpriseUrl)}`
+    : "https://api.githubcopilot.com";
+}
+
+function routeRequestURL(value: string, account: StoredAccount): string {
+  const url = new URL(value);
+  const base = new URL(accountBaseURL(account));
+  url.protocol = base.protocol;
+  url.host = base.host;
+  url.username = "";
+  url.password = "";
+  return url.href;
 }
 
 function getUrls(domain: string) {
@@ -245,6 +258,9 @@ function normalizeStoredAccount(raw: unknown): StoredAccount | undefined {
     id,
     name,
     refreshToken,
+    enterpriseUrl: typeof raw.enterpriseUrl === "string" && raw.enterpriseUrl
+      ? normalizeDomain(raw.enterpriseUrl) : undefined,
+    tokenHash: typeof raw.tokenHash === "string" ? raw.tokenHash : undefined,
     accessToken,
     accessTokenExpiresAt,
     priority,
@@ -255,18 +271,15 @@ function normalizeStoredAccount(raw: unknown): StoredAccount | undefined {
 }
 
 function normalizeStorage(raw: unknown): StorageShape {
-  if (!isRecord(raw) || !Array.isArray(raw.accounts)) {
-    return { version: 1, accounts: [] };
+  if (!isRecord(raw) || !Array.isArray(raw.accounts) ||
+      (raw.version !== undefined && raw.version !== 1)) {
+    throw new Error("Invalid account storage; repair or restore the file before logging in");
   }
-
-  const accounts = raw.accounts
-    .map((item) => normalizeStoredAccount(item))
-    .filter((item): item is StoredAccount => !!item);
-
-  return {
-    version: 1,
-    accounts,
-  };
+  const accounts = raw.accounts.map(normalizeStoredAccount);
+  if (accounts.some((account) => !account) || new Set(accounts.map((a) => a!.id)).size !== accounts.length) {
+    throw new Error("Invalid or duplicate account in storage; refusing to discard existing data");
+  }
+  return { version: 1, accounts: accounts as StoredAccount[] };
 }
 
 // Keychain abstraction: prefer OS keychain via keytar when available.
@@ -310,7 +323,8 @@ async function initKeychain(): Promise<void> {
   try {
     // Attempt dynamic import of keytar
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const mod = await import("keytar");
+    const imported = await import("keytar");
+    const mod = imported.default ?? imported;
     if (mod && typeof mod.getPassword === "function") {
       keytarModule = mod;
       keychainAvailableFlag = true;
@@ -361,7 +375,7 @@ function normalizeAccountID(value: string | undefined): string | undefined {
 function mergeAccount(
   accounts: StoredAccount[],
   refreshToken: string,
-  opts?: { id?: string; name?: string; priority?: number },
+  opts?: { id?: string; name?: string; priority?: number; enterpriseUrl?: string },
 ) {
   const tokenDerivedID = shaTokenId(refreshToken);
   const providedID = normalizeAccountID(opts?.id);
@@ -370,13 +384,15 @@ function mergeAccount(
     (acc) =>
       acc.id === id ||
       acc.id === tokenDerivedID ||
-      acc.refreshToken === refreshToken,
+      acc.refreshToken === refreshToken || acc.tokenHash === tokenDerivedID,
   );
 
   const candidate: StoredAccount = {
     id,
     name: opts?.name?.trim() || `copilot-${id.slice(0, 6)}`,
     refreshToken,
+    tokenHash: tokenDerivedID,
+    enterpriseUrl: opts?.enterpriseUrl,
     priority: Number.isFinite(opts?.priority)
       ? (opts?.priority as number)
       : 100,
@@ -393,8 +409,10 @@ function mergeAccount(
   const existing = accounts[existingIndex];
   const merged: StoredAccount = {
     ...existing,
-    id,
+    id: providedID || existing.id,
     refreshToken,
+    tokenHash: tokenDerivedID,
+    enterpriseUrl: opts?.enterpriseUrl,
     name: existing.name || candidate.name,
     // Clear cached access token when refresh token is updated
     accessToken: undefined,
@@ -406,7 +424,7 @@ function mergeAccount(
 }
 
 // In-memory cache to avoid hot-path disk I/O. Lazy-loaded on first access.
-let storageCache: { value: StorageShape; loadedAt: number } | null = null;
+let storageCache: { value: StorageShape; loadedAt: number; filePath: string } | null = null;
 const STORAGE_CACHE_TTL_MS = Number(
   process.env.COPILOT_STORAGE_CACHE_TTL_MS || 5000,
 );
@@ -423,7 +441,6 @@ function resetRuntimeState() {
   metrics.attemptsByAccount.clear();
   metrics.successesByAccount.clear();
   metrics.failuresByType = { "429": 0, "403": 0, other: 0 };
-  metrics.refresh = { success: 0, fail: 0 };
   keychainInitialized = false;
   keychainAvailableFlag = false;
   keytarModule = null;
@@ -443,35 +460,54 @@ export const __fs = {
 };
 
 async function loadStorage(): Promise<StorageShape> {
-  // Return cached value when available and fresh
-  if (
-    storageCache &&
-    Date.now() - storageCache.loadedAt < STORAGE_CACHE_TTL_MS
-  ) {
-    return storageCache.value;
-  }
-
   const filePath = getStorageFilePath();
-  const raw = await __fs.readFile(filePath, "utf8").catch(() => "");
-  // Ensure parsed always has the exact StorageShape type (avoid widening numeric literal and empty array types)
-  const parsed = raw
-    ? normalizeStorage(parseJson<unknown>(raw))
-    : normalizeStorage(undefined);
+  if (storageCache?.filePath === filePath &&
+      Date.now() - storageCache.loadedAt < STORAGE_CACHE_TTL_MS) {
+    return structuredClone(storageCache.value);
+  }
+  let parsed: StorageShape;
+  try {
+    const raw = await __fs.readFile(filePath, "utf8");
+    parsed = normalizeStorage(parseJson<unknown>(raw));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    parsed = { version: 1, accounts: [] };
+  }
+  storageCache = { value: parsed, loadedAt: Date.now(), filePath };
+  return structuredClone(parsed);
+}
 
-  storageCache = { value: parsed, loadedAt: Date.now() };
-  return parsed;
+// Every production mutation reads the latest file while holding an inter-process lock.
+async function updateStorage(update: (storage: StorageShape) => Promise<void>): Promise<void> {
+  const filePath = getStorageFilePath();
+  await mkdir(dirname(filePath), { recursive: true, mode: 0o700 });
+  let compromised: Error | undefined;
+  const release = await lockfile.lock(filePath, {
+    realpath: false,
+    stale: 10_000,
+    retries: { retries: 20, minTimeout: 25, maxTimeout: 500 },
+    onCompromised: (error) => { compromised = error; },
+  });
+  try {
+    invalidateStorageCache();
+    const storage = await loadStorage();
+    await update(storage);
+    if (compromised) throw compromised;
+    await saveStorage(storage);
+  } finally {
+    await release();
+  }
 }
 
 // Atomic save: write to temp file in same dir then rename to final path.
 async function saveStorage(storage: StorageShape): Promise<void> {
   const filePath = getStorageFilePath();
-  await __fs.mkdir(dirname(filePath), { recursive: true });
-
   const tempPath = `${filePath}.tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const contents = JSON.stringify(storage, null, 2);
 
   try {
-    await __fs.writeFile(tempPath, contents, "utf8");
+    await __fs.mkdir(dirname(filePath), { recursive: true, mode: 0o700 });
+    await __fs.writeFile(tempPath, contents, { encoding: "utf8", mode: 0o600, flag: "wx" });
     await __fs.rename(tempPath, filePath);
     // Best-effort hardening: final file readable/writable only by owner.
     try {
@@ -482,172 +518,40 @@ async function saveStorage(storage: StorageShape): Promise<void> {
     try {
       await __fs.unlink(tempPath).catch(() => undefined);
     } catch {}
+    // Callers may have mutated the cached object before attempting the save.
+    // Reload the last persisted state after a failed write.
+    invalidateStorageCache();
     throw err;
-  } finally {
-    // Update in-memory cache to reflect latest persisted storage
-    storageCache = { value: storage, loadedAt: Date.now() };
   }
+  // Only cache a successful write.
+  storageCache = { value: structuredClone(storage), loadedAt: Date.now(), filePath };
 }
 
-async function upsertOAuthToken(refreshToken: string): Promise<void> {
-  if (!refreshToken.trim()) return;
-  // Prefer storing refresh tokens in keychain when available.
-  // If keychain write fails, fall back to file storage with restricted perms.
-  const storage = await loadStorage();
-  const updated = mergeAccount(storage.accounts, refreshToken);
-
-  // Attempt to store secret in keychain per-account; use derived id
-  const id = shaTokenId(refreshToken);
-  const keychainOk = await keychainSet(id, refreshToken).catch(() => false);
-  if (keychainOk) {
-    // Remove raw refresh token from storage and keep placeholder
-    const sanitized = updated.map((acc) => ({
-      ...acc,
-      refreshToken: acc.id === id ? "[KEYCHAIN]" : acc.refreshToken,
-    }));
-    storage.accounts = sanitized;
-  } else {
-    // fallback: store full token in file storage but ensure perms and warn
-    storage.accounts = updated;
-    try {
-      const filePath = getStorageFilePath();
-      await chmod(dirname(filePath), 0o700).catch(() => undefined);
-      // Note: file itself will be written by saveStorage and created with user's umask
-    } catch {}
-  }
-
-  await saveStorage(storage);
+async function storeOAuthAccount(token: string, opts: { id?: string; enterpriseUrl?: string } = {}): Promise<void> {
+  if (!token.trim() || token === "[KEYCHAIN]") throw new Error("Missing OAuth credential");
+  const enterpriseUrl = opts.enterpriseUrl ? normalizeDomain(opts.enterpriseUrl) : undefined;
+  await updateStorage(async (storage) => {
+    const accounts = mergeAccount(storage.accounts, token, { ...opts, enterpriseUrl });
+    const account = accounts.find((item) => item.tokenHash === shaTokenId(token))!;
+    if (await keychainSet(account.id, token)) account.refreshToken = "[KEYCHAIN]";
+    // Older versions persisted cached access tokens. New writes never duplicate this secret.
+    for (const item of accounts) {
+      delete item.accessToken;
+      delete item.accessTokenExpiresAt;
+    }
+    storage.accounts = accounts;
+  });
 }
 
-/**
- * Get or refresh a valid OAuth access token for a Copilot account.
- * GitHub OAuth tokens are short-lived (1 hour), so we cache and refresh as needed.
- */
+/** GitHub device OAuth tokens are used directly, matching OpenCode's Copilot transport. */
 async function getValidAccessToken(account: StoredAccount): Promise<string> {
-  const now = Date.now() / 1000; // seconds
-  const expiresAt = (account.accessTokenExpiresAt ?? 0) / 1000;
-  const timeUntilExpiry = expiresAt - now;
-
-  // Prefer a cached valid access token (with safety margin)
-  if (account.accessToken && timeUntilExpiry > TOKEN_REFRESH_MARGIN_SECONDS) {
-    return account.accessToken;
+  const token = account.refreshToken === "[KEYCHAIN]"
+    ? await keychainGet(account.id)
+    : account.refreshToken;
+  if (!token?.trim() || token === "[KEYCHAIN]") {
+    throw new Error("Missing OAuth credential; log in to this account again");
   }
-
-  log(
-    `No valid cached access token for account ${account.name} (${account.id}), attempting refresh`,
-    "info",
-  );
-
-  // Attempt refresh flow using stored refresh token.
-  // We expect the token endpoint to accept a refresh_token grant and return { access_token, expires_in }
-  async function refreshAccessToken(
-    refreshToken: string,
-  ): Promise<{ access: string; expiresIn: number }> {
-    const urls = getUrls("github.com");
-    try {
-      const res = await fetch(urls.ACCESS_TOKEN_URL, {
-        method: "POST",
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/json",
-          "User-Agent": USER_AGENT,
-        },
-        body: JSON.stringify({
-          client_id: CLIENT_ID,
-          grant_type: "refresh_token",
-          refresh_token: refreshToken,
-        }),
-      });
-
-      const body = await res
-        .clone()
-        .json()
-        .catch(() => ({}));
-
-      if (!res.ok) {
-        // Distinguish invalid_grant (non-recoverable) vs transient errors
-        const err = typeof body.error === "string" ? body.error : undefined;
-        if (res.status === 400 && err === "invalid_grant") {
-          const e = new Error("invalid_grant");
-          (e as any).code = "invalid_grant";
-          throw e;
-        }
-        const e = new Error("token_refresh_failed");
-        (e as any).status = res.status;
-        throw e;
-      }
-
-      const access =
-        typeof body.access_token === "string" ? body.access_token : undefined;
-      const expiresIn =
-        typeof body.expires_in === "number" ? body.expires_in : undefined;
-
-      if (!access) {
-        const e = new Error("token_refresh_no_access_token");
-        throw e;
-      }
-
-      return { access, expiresIn: expiresIn ?? 3600 };
-    } catch (err) {
-      // Re-throw to be handled by caller
-      throw err;
-    }
-  }
-
-  // If we don't have a refresh token, we cannot refresh -> explicit error to force re-auth
-  if (!account.refreshToken || !account.refreshToken.trim()) {
-    const e = new Error("no_refresh_token");
-    (e as any).code = "no_refresh_token";
-    throw e;
-  }
-
-  try {
-    // If the refresh token is stored as placeholder, try reading from keychain
-    let refreshToUse = account.refreshToken;
-    if (refreshToUse === "[KEYCHAIN]") {
-      const fromKeychain = await keychainGet(account.id).catch(() => null);
-      if (fromKeychain) refreshToUse = fromKeychain;
-    }
-
-    let result;
-    try {
-      result = await refreshAccessToken(refreshToUse);
-      recordRefreshSuccess();
-    } catch (err) {
-      recordRefreshFail();
-      throw err;
-    }
-
-    // Persist new access token and expiry
-    const storage = await loadStorage();
-    const accountIndex = storage.accounts.findIndex((a) => a.id === account.id);
-    if (accountIndex >= 0) {
-      storage.accounts[accountIndex].accessToken = result.access;
-      storage.accounts[accountIndex].accessTokenExpiresAt =
-        Date.now() + result.expiresIn * 1000;
-      await saveStorage(storage);
-    }
-
-    return result.access;
-  } catch (err: any) {
-    // For invalid_grant or missing refresh token, surface explicit error so caller can force re-auth
-    if (err && err.code === "invalid_grant") {
-      log(
-        `Refresh failed with invalid_grant for account ${account.id}`,
-        "error",
-      );
-      const e = new Error("invalid_grant");
-      (e as any).code = "invalid_grant";
-      throw e;
-    }
-
-    // For other errors, treat as transient and rethrow so caller may try other accounts
-    log(
-      `Refresh failed for account ${account.id}: ${err instanceof Error ? err.message : String(err)}`,
-      "warn",
-    );
-    throw err;
-  }
+  return token;
 }
 
 function modelAllowedByRule(
@@ -745,9 +649,10 @@ function getRetryDelaySeconds(
   const retryAfter = response.headers.get("retry-after");
   if (!retryAfter) return fallbackSeconds;
 
-  const numeric = Number.parseInt(retryAfter, 10);
-  if (Number.isFinite(numeric) && numeric > 0) return numeric;
-  return fallbackSeconds;
+  const numeric = Number(retryAfter);
+  if (Number.isFinite(numeric) && numeric >= 0) return numeric;
+  const date = Date.parse(retryAfter);
+  return Number.isFinite(date) ? Math.max(0, Math.ceil((date - Date.now()) / 1000)) : fallbackSeconds;
 }
 
 async function isQuotaOrRateLimit(response: Response): Promise<boolean> {
@@ -792,39 +697,15 @@ async function prepareReplayableRequest(
   request: RequestInfo | URL,
   init?: RequestInit,
 ): Promise<{ url: string; init: RequestInit }> {
-  if (request instanceof Request) {
-    const mergedHeaders = new Headers(request.headers);
-    if (init?.headers) {
-      const next = new Headers(init.headers);
-      for (const [k, v] of next.entries()) mergedHeaders.set(k, v);
-    }
-
-    const method = init?.method ?? request.method;
-    const shouldReadBody = method !== "GET" && method !== "HEAD";
-    let body: BodyInit | undefined = (init?.body ?? undefined) as
-      | BodyInit
-      | undefined;
-    if (init?.body === null) body = undefined;
-    if (body === undefined && shouldReadBody) {
-      body = await request.clone().text();
-    }
-
-    return {
-      url: request.url,
-      init: {
-        ...init,
-        method,
-        headers: mergedHeaders,
-        body,
-      },
-    };
-  }
-
+  const merged = new Request(request, init);
   return {
-    url: request instanceof URL ? request.href : request.toString(),
+    url: merged.url,
     init: {
-      ...init,
-      headers: new Headers(init?.headers),
+      method: merged.method,
+      headers: new Headers(merged.headers),
+      body: merged.body ? await merged.clone().text() : undefined,
+      signal: merged.signal,
+      redirect: "error",
     },
   };
 }
@@ -860,6 +741,16 @@ function detectInitiatorAndVision(
         );
       });
       return { isVision, isAgent: last?.role !== "user" };
+    }
+
+    if (Array.isArray(body.messages)) {
+      const last = body.messages.at(-1);
+      const hasUserContent = isRecord(last) && last.role === "user" &&
+        (typeof last.content === "string" || (Array.isArray(last.content) &&
+          last.content.some((part) => isRecord(part) && part.type !== "tool_result")));
+      const hasImage = (value: unknown): boolean => Array.isArray(value) && value.some((part) =>
+        isRecord(part) && (part.type === "image" || (part.type === "tool_result" && hasImage(part.content))));
+      return { isAgent: !hasUserContent, isVision: body.messages.some((msg) => isRecord(msg) && hasImage(msg.content)) };
     }
 
     if (Array.isArray(body.input)) {
@@ -898,6 +789,7 @@ export const CopilotMultiAuthPlugin: Plugin = async (
 
     const deviceResponse = await fetch(urls.DEVICE_CODE_URL, {
       method: "POST",
+      signal: AbortSignal.timeout(30_000),
       headers: {
         Accept: "application/json",
         "Content-Type": "application/json",
@@ -922,16 +814,20 @@ export const CopilotMultiAuthPlugin: Plugin = async (
       user_code: string;
       device_code: string;
       interval: number;
+      expires_in?: number;
     };
 
+    const deadline = Date.now() + (deviceData.expires_in ?? 900) * 1000;
+    let interval = Math.max(1, deviceData.interval || 5);
     return {
       url: deviceData.verification_uri,
       instructions: `Enter code: ${deviceData.user_code}`,
       method: "auto" as const,
       async callback() {
-        while (true) {
+        while (Date.now() < deadline) {
           const response = await fetch(urls.ACCESS_TOKEN_URL, {
             method: "POST",
+            signal: AbortSignal.timeout(30_000),
             headers: {
               Accept: "application/json",
               "Content-Type": "application/json",
@@ -954,35 +850,16 @@ export const CopilotMultiAuthPlugin: Plugin = async (
 
           if (data.access_token) {
             log(
-              `OAuth authorization successful, storing refresh token`,
+              `OAuth authorization successful, storing account credential`,
               "info",
             );
 
             try {
-              // On new authorization, attempt to store secret in keychain first.
-              const derivedId = shaTokenId(data.access_token);
-              const storageAccountID = accountID || derivedId;
-              const kcOk = await keychainSet(
-                storageAccountID,
-                data.access_token,
-              ).catch(() => false);
+              await storeOAuthAccount(data.access_token, {
+                id: accountID,
+                enterpriseUrl: isEnterprise ? domain : undefined,
+              });
               const storage = await loadStorage();
-              storage.accounts = mergeAccount(
-                storage.accounts,
-                data.access_token,
-                { id: accountID },
-              );
-
-              if (kcOk) {
-                // Replace raw token with placeholder for security
-                storage.accounts = storage.accounts.map((acc) =>
-                  acc.id === storageAccountID
-                    ? { ...acc, refreshToken: "[KEYCHAIN]" }
-                    : acc,
-                );
-              }
-
-              await saveStorage(storage);
               log(
                 `Successfully saved account to local storage (${storage.accounts.length} total accounts)`,
                 "info",
@@ -992,6 +869,7 @@ export const CopilotMultiAuthPlugin: Plugin = async (
                 `Failed to save account to local storage: ${err instanceof Error ? err.message : String(err)}`,
                 "error",
               );
+              return { type: "failed" as const };
             }
 
             const result: {
@@ -1016,46 +894,42 @@ export const CopilotMultiAuthPlugin: Plugin = async (
 
           if (data.error === "authorization_pending") {
             await sleep(
-              deviceData.interval * 1000 + OAUTH_POLLING_SAFETY_MARGIN_MS,
+              interval * 1000 + OAUTH_POLLING_SAFETY_MARGIN_MS,
             );
             continue;
           }
 
           if (data.error === "slow_down") {
             const serverInterval = data.interval;
-            const interval =
+            interval =
               serverInterval &&
               Number.isFinite(serverInterval) &&
               serverInterval > 0
                 ? serverInterval
-                : deviceData.interval + 5;
+                : interval + 5;
             await sleep(interval * 1000 + OAUTH_POLLING_SAFETY_MARGIN_MS);
             continue;
           }
 
           return { type: "failed" as const };
         }
+        return { type: "failed" as const };
       },
     };
   }
 
   return {
     auth: {
-      // Override the built-in GitHub Copilot auth transport rather than
-      // registering a new provider id with no model catalog behind it.
       provider: "github-copilot",
       async loader(getAuth) {
         const info = await getAuth();
         if (!info || info.type !== "oauth") return {};
 
-        const enterpriseUrl = (info as { enterpriseUrl?: string })
-          .enterpriseUrl;
-        const baseURL = enterpriseUrl
-          ? `https://copilot-api.${normalizeDomain(enterpriseUrl)}`
-          : undefined;
-
+        // Import a pre-existing built-in login only when no pool has been configured.
+        if (!(await loadStorage()).accounts.length && info.refresh) {
+          await storeOAuthAccount(info.refresh, { enterpriseUrl: info.enterpriseUrl });
+        }
         return {
-          baseURL,
           apiKey: "",
           async fetch(request: RequestInfo | URL, init?: RequestInit) {
             const storage = await loadStorage();
@@ -1082,7 +956,7 @@ export const CopilotMultiAuthPlugin: Plugin = async (
             );
 
             log(
-              `Request: ${replayable.url} (model=${modelID}, agent=${isAgent}, vision=${isVision})`,
+              `Request: ${new URL(replayable.url).pathname} (model=${modelID}, agent=${isAgent}, vision=${isVision})`,
             );
 
             const excluded = new Set<string>();
@@ -1092,7 +966,9 @@ export const CopilotMultiAuthPlugin: Plugin = async (
             );
 
             let lastResponse: Response | undefined;
+            let lastError: Error | undefined;
             for (let attempt = 0; attempt < maxAttempts; attempt++) {
+              replayable.init.signal?.throwIfAborted();
               const selected = pickAccount(accounts, modelID, excluded);
               // record attempt metric for selected account (if any)
               recordAttempt(selected?.id);
@@ -1101,24 +977,24 @@ export const CopilotMultiAuthPlugin: Plugin = async (
                 break;
               }
 
-              // Get valid access token (may refresh from refresh token)
+              // Resolve the OAuth credential locally; never send a refresh grant.
               let accessToken: string;
               try {
                 accessToken = await getValidAccessToken(selected);
-              } catch (err) {
-                log(
-                  `Auth refresh failed for account ${selected.name}: ${err instanceof Error ? err.message : String(err)}`,
-                  "warn",
-                );
+              } catch {
+                recordFailure(401);
+                lastError = new Error("An account credential is unavailable; log in again");
+                log(`Credential unavailable for account ${selected.id}; trying next account`, "warn");
                 excluded.add(selected.id);
                 continue;
               }
 
               const headers = new Headers(replayable.init.headers);
-              headers.set("x-initiator", isAgent ? "agent" : "user");
+              if (!headers.has("x-initiator")) headers.set("x-initiator", isAgent ? "agent" : "user");
               headers.set("User-Agent", USER_AGENT);
               headers.set("Authorization", `Bearer ${accessToken}`);
               headers.set("Openai-Intent", "conversation-edits");
+              headers.set("X-GitHub-Api-Version", "2026-06-01");
               headers.delete("x-api-key");
 
               if (isVision) headers.set("Copilot-Vision-Request", "true");
@@ -1126,10 +1002,27 @@ export const CopilotMultiAuthPlugin: Plugin = async (
               log(
                 `Attempt ${attempt + 1}/${maxAttempts}: Using account ${selected.name}`,
               );
-              const response = await fetch(replayable.url, {
-                ...replayable.init,
-                headers,
-              });
+              let response: Response;
+              try {
+                response = await fetch(routeRequestURL(replayable.url, selected), {
+                  ...replayable.init, headers,
+                });
+              } catch {
+                replayable.init.signal?.throwIfAborted();
+                recordFailure(0);
+                lastError = new Error("Copilot network request failed for all eligible accounts");
+                excluded.add(selected.id);
+                cooldownUntilByAccount.set(selected.id, Date.now() + 10_000);
+                continue;
+              }
+              if (lastResponse) await lastResponse.body?.cancel().catch(() => undefined);
+              lastResponse = response;
+              if (!response.ok) recordFailure(response.status);
+              if (response.status === 401 || response.status >= 500) {
+                excluded.add(selected.id);
+                cooldownUntilByAccount.set(selected.id, Date.now() + DEFAULT_COOLDOWN_SECONDS * 1000);
+                continue;
+              }
 
               const modelUnavailable = await isModelUnavailableError(response);
               if (modelUnavailable) {
@@ -1149,12 +1042,11 @@ export const CopilotMultiAuthPlugin: Plugin = async (
                   selected.id,
                   (usageCountByAccount.get(selected.id) || 0) + 1,
                 );
-                recordSuccess(selected.id);
-                log(`Success: Request completed (status=${response.status})`);
+                if (response.ok) recordSuccess(selected.id);
+                log(`Request completed (status=${response.status})`);
                 return response;
               }
 
-              recordFailure(response.status);
               log(
                 `Quota/rate-limit hit for account ${selected.name} (status=${response.status}), trying next account`,
                 "warn",
@@ -1184,9 +1076,7 @@ export const CopilotMultiAuthPlugin: Plugin = async (
               "All Copilot accounts are unavailable for this request.",
               "error",
             );
-            throw new Error(
-              "All Copilot accounts are unavailable for this request.",
-            );
+            throw lastError ?? new Error("All Copilot accounts are unavailable for this request.");
           },
         };
       },
@@ -1239,14 +1129,10 @@ export const CopilotMultiAuthPlugin: Plugin = async (
               validate: (value: string) => {
                 if (!value || !value.trim()) return "URL or domain is required";
                 try {
-                  const url = value.includes("://")
-                    ? new URL(value)
-                    : new URL(`https://${value}`);
-                  if (!url.hostname)
-                    return "Please enter a valid URL or domain";
+                  normalizeDomain(value);
                   return undefined;
                 } catch {
-                  return "Please enter a valid URL (e.g., company.ghe.com or https://company.ghe.com)";
+                  return "Enter an HTTPS domain without credentials, port, path, query, or fragment";
                 }
               },
             },
@@ -1260,13 +1146,17 @@ export const CopilotMultiAuthPlugin: Plugin = async (
             return startDeviceOAuth(domain, true, accountID);
           },
         },
-      ] as any,
+      ],
     },
   };
 };
 
 export const __testExports = {
   getOpencodeConfigDirectory,
+  normalizeDomain,
+  routeRequestURL,
+  storeOAuthAccount,
+  getRetryDelaySeconds,
   modelAllowedByRule,
   pickAccount,
   isQuotaOrRateLimit,
@@ -1291,8 +1181,7 @@ export const __testExports = {
     metrics.attemptsByAccount.clear();
     metrics.successesByAccount.clear();
     metrics.failuresByType = { "429": 0, "403": 0, other: 0 };
-    metrics.refresh = { success: 0, fail: 0 };
-  },
+    },
 };
 
 export default CopilotMultiAuthPlugin;

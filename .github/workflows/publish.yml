@@ -1,0 +1,68 @@
+name: Publish npm package
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [22.x, 24.x]
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm pack --dry-run
+      - name: Verify release version and main ancestry
+        if: github.event_name == 'release'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          node --input-type=module -e "import fs from 'node:fs'; const p = JSON.parse(fs.readFileSync('package.json')); if (process.env.RELEASE_TAG !== 'v' + p.version) throw new Error('Release tag must match package version');"
+          git merge-base --is-ancestor HEAD origin/main
+
+  publish:
+    if: github.event_name == 'release'
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 24.x
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - name: Install npm with trusted publishing support
+        run: npm install --global npm@11.19.0
+      - run: npm ci --ignore-scripts
+      - name: Publish with npm OIDC
+        env:
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          if [ "$IS_PRERELEASE" = "true" ]; then
+            npm publish --access public --provenance --tag next
+          else
+            npm publish --access public --provenance
+          fi

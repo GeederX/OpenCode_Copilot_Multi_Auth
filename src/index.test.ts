@@ -13,6 +13,11 @@ describe("multi-auth oauth helpers", () => {
     expect(id1).not.toBe(id3);
   });
 
+  it("overrides the built-in github-copilot provider id", async () => {
+    const hooks = await CopilotMultiAuthPlugin({} as any);
+    expect(hooks.auth?.provider).toBe("github-copilot");
+  });
+
   it("merges account by token identity", () => {
     const first = __testExports.mergeAccount([], "token-a");
     const second = __testExports.mergeAccount(first, "token-a");

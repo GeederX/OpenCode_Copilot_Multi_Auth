@@ -1041,7 +1041,9 @@ export const CopilotMultiAuthPlugin: Plugin = async (
 
   return {
     auth: {
-      provider: "github-copilot-multi",
+      // Override the built-in GitHub Copilot auth transport rather than
+      // registering a new provider id with no model catalog behind it.
+      provider: "github-copilot",
       async loader(getAuth) {
         const info = await getAuth();
         if (!info || info.type !== "oauth") return {};

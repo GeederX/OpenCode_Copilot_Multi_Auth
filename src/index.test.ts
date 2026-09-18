@@ -71,33 +71,11 @@ describe("multi-auth oauth helpers", () => {
     expect(typeof s1).toBe("string");
   });
 
-  it("prefers valid access token over refresh and refreshes when expired", async () => {
-    // Create an account with an expired access token and a fake refresh token
-    const account = __testExports.mergeAccount([], "refresh-token")[0]!;
-    account.accessToken = "old-access";
-    account.accessTokenExpiresAt = Date.now() - 1000; // expired
-
-    // Mock fetch to simulate token endpoint returning new access token
-    // @ts-ignore globalThis for test environment
-    const originalFetch = globalThis.fetch;
-    // token endpoint
-    // @ts-ignore
-    globalThis.fetch = (url: RequestInfo, init?: RequestInit) => {
-      const s = url.toString();
-      if (s.includes("/login/oauth/access_token")) {
-        return Promise.resolve(new Response(JSON.stringify({ access_token: "new-access", expires_in: 3600 }), { status: 200 }));
-      }
-      return Promise.resolve(new Response("ok", { status: 200 }));
-    };
-
-    try {
-      const token = await __testExports.getValidAccessToken(account);
-      expect(token).toBe("new-access");
-    } finally {
-      // restore
-      // @ts-ignore
-      globalThis.fetch = originalFetch;
-    }
+  it("uses the device OAuth token directly without a refresh grant", async () => {
+    const account = __testExports.mergeAccount([], "device-oauth-token")[0]!;
+    account.accessToken = "obsolete-cache";
+    account.accessTokenExpiresAt = Date.now() + 3600000;
+    await expect(__testExports.getValidAccessToken(account)).resolves.toBe("device-oauth-token");
   });
 
   it("uses keychain when available for storing and retrieving tokens", async () => {
@@ -203,33 +181,16 @@ describe("multi-auth oauth helpers", () => {
     }
   });
 
-  it("throws explicit error when refresh fails with invalid_grant", async () => {
-    const account = __testExports.mergeAccount([], "refresh-token")[0]!;
-    account.accessToken = undefined;
-    account.accessTokenExpiresAt = undefined;
-
-    const originalFetch = globalThis.fetch;
-    // @ts-ignore
-    globalThis.fetch = (url: RequestInfo, init?: RequestInit) => {
-      if (url.toString().includes("/login/oauth/access_token")) {
-        return Promise.resolve(new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 }));
-      }
-      return Promise.resolve(new Response("ok", { status: 200 }));
-    };
-
-    try {
-      await expect(__testExports.getValidAccessToken(account)).rejects.toThrow();
-    } finally {
-      // @ts-ignore
-      globalThis.fetch = originalFetch;
-    }
+  it("rejects a missing keychain credential instead of sending its placeholder", async () => {
+    const account = __testExports.mergeAccount([], "[KEYCHAIN]", { id: "missing-account" })[0]!;
+    await expect(__testExports.getValidAccessToken(account)).rejects.toThrow("Missing OAuth credential");
   });
 
-  it("fails over to the next account when token refresh fails", async () => {
+  it("fails over to the next account when a credential is unavailable", async () => {
     __testExports.resetRuntimeState();
 
     const first = {
-      ...__testExports.mergeAccount([], "bad-token")[0]!,
+      ...__testExports.mergeAccount([], "[KEYCHAIN]", { id: "missing-account" })[0]!,
       name: "first",
     };
     const second = {
@@ -272,29 +233,11 @@ describe("multi-auth oauth helpers", () => {
     // @ts-ignore
     globalThis.fetch = (url: RequestInfo | URL, init?: RequestInit) => {
       const href = url.toString();
-      if (href.includes("/login/oauth/access_token")) {
-        const body = JSON.parse(String(init?.body || "{}"));
-        if (body.refresh_token === "bad-token") {
-          return Promise.resolve(
-            new Response(JSON.stringify({ error: "invalid_grant" }), {
-              status: 400,
-            }),
-          );
-        }
-        if (body.refresh_token === "good-token") {
-          return Promise.resolve(
-            new Response(
-              JSON.stringify({ access_token: "good-access", expires_in: 3600 }),
-              { status: 200 },
-            ),
-          );
-        }
-      }
 
       if (href.includes("/chat/completions")) {
         const auth = new Headers(init?.headers).get("authorization");
         return Promise.resolve(
-          new Response("ok", { status: auth === "Bearer good-access" ? 200 : 401 }),
+          new Response("ok", { status: auth === "Bearer good-token" ? 200 : 401 }),
         );
       }
 
@@ -324,8 +267,7 @@ describe("multi-auth oauth helpers", () => {
       expect(await response.text()).toBe("ok");
 
       const metrics = __testExports.__metrics_get();
-      expect(metrics.refresh.fail).toBe(1);
-      expect(metrics.refresh.success).toBe(1);
+      expect(metrics.failuresByType.other).toBe(1);
       expect(metrics.attemptsByAccount[first.id]).toBe(1);
       expect(metrics.attemptsByAccount[second.id]).toBe(1);
       expect(metrics.successesByAccount[second.id]).toBe(1);

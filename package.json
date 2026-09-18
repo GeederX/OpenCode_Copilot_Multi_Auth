@@ -1,21 +1,36 @@
 {
   "name": "@geeder/opencode-copilot-multi-auth",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "OpenCode plugin for GitHub Copilot multi-account management with automatic quota-aware failover and model-aware routing",
   "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "main": "./dist/plugin.js",
+  "types": "./dist/plugin.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/plugin.d.ts",
+      "import": "./dist/plugin.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "MAINTENANCE.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "RELEASING.md"
   ],
   "scripts": {
-    "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json",
+    "build": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "prepublishOnly": "npm run build && npm run test"
+    "check": "npm run typecheck && npm run test:coverage && npm run build && npm run test:integration",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run check",
+    "test:integration": "node --test scripts/*.test.mjs"
   },
   "keywords": [
     "opencode",
@@ -29,28 +44,30 @@
   "author": "OpenCode Contributors",
   "repository": {
     "type": "git",
-    "url": "https://github.com/GeederX/opencode-copilot-multi-auth.git"
+    "url": "https://github.com/GeederX/OpenCode_Copilot_Multi_Auth.git"
   },
-  "homepage": "https://github.com/GeederX/opencode-copilot-multi-auth#readme",
+  "homepage": "https://github.com/GeederX/OpenCode_Copilot_Multi_Auth#readme",
   "bugs": {
-    "url": "https://github.com/GeederX/opencode-copilot-multi-auth/issues"
+    "url": "https://github.com/GeederX/OpenCode_Copilot_Multi_Auth/issues"
   },
   "engines": {
-    "node": ">=20"
+    "node": "^22.12.0 || ^24.0.0 || >=26.0.0"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^0.15.30"
+    "@opencode-ai/plugin": "^1.18.31",
+    "proper-lockfile": "^4.1.2"
   },
   "devDependencies": {
     "@types/node": "^24.2.0",
-    "@vitest/coverage-v8": "^3.2.4",
+    "@types/proper-lockfile": "^4.1.4",
+    "@vitest/coverage-v8": "^5.0.1",
     "typescript": "^5.9.2",
-    "vitest": "^3.2.4"
+    "vitest": "^5.0.1"
   },
   "optionalDependencies": {
-    "keytar": "*"
+    "keytar": "^7.9.0"
   }
 }
